@@ -1,0 +1,221 @@
+import jieba
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report
+)
+from torch.utils.data import TensorDataset, DataLoader
+
+# ===================== 1. ID -> 中文标签映射（覆盖你数据集里的所有类别） =====================
+id_to_name = {
+    "101": "文化",
+    "102": "娱乐",
+    "103": "体育",
+    "104": "财经",
+    "106": "房产",
+    "107": "汽车",
+    "108": "教育",
+    "109": "科技",
+    "110": "军事",
+    "112": "旅游",
+    "113": "国际",
+    "114": "股票",
+    "115": "农业",
+    "116": "游戏"
+}
+
+# ===================== 读取数据 =====================
+texts = []
+labels = []
+
+with open("data/toutiao_cat_data.txt", "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+# 读取前20000条数据
+for line in lines[:20000]:
+    parts = line.split("_!_")
+    if len(parts) > 3:
+        label_id = parts[1]
+        title = parts[3]
+        words = jieba.cut(title)
+        text = " ".join(words)
+        texts.append(text)
+        labels.append(label_id)
+
+print("数据读取完成")
+
+# ===================== 标签编码 =====================
+label_encoder = LabelEncoder()
+labels = label_encoder.fit_transform(labels)
+# 编码对应的原始ID列表
+raw_label_ids = label_encoder.classes_
+# 转为中文类别名（用于分类报告）
+class_names = [id_to_name.get(lid, "未知") for lid in raw_label_ids]
+print("所有分类（中文）：", class_names)
+
+# ===================== 建立词表 & 文本序列化 =====================
+word2idx = {}
+idx = 1
+for text in texts:
+    for word in text.split():
+        if word not in word2idx:
+            word2idx[word] = idx
+            idx += 1
+print("词表大小：", len(word2idx))
+
+max_len = 30
+X = []
+for text in texts:
+    seq = []
+    for word in text.split():
+        seq.append(word2idx.get(word, 0))
+    seq = seq[:max_len]
+    while len(seq) < max_len:
+        seq.append(0)
+    X.append(seq)
+
+# 转为Tensor
+X = torch.tensor(X)
+y = torch.tensor(labels)
+
+# ===================== 划分数据集 =====================
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42
+)
+
+# ===================== DataLoader 批次加载 =====================
+batch_size = 64
+train_dataset = TensorDataset(X_train, y_train)
+test_dataset = TensorDataset(X_test, y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+# ===================== GPU/CPU 设备 =====================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("当前设备：", device)
+
+# ===================== 多卷积核 TextCNN 模型 =====================
+class TextCNN(nn.Module):
+    def __init__(self):
+        super(TextCNN, self).__init__()
+        self.embedding = nn.Embedding(
+            num_embeddings=len(word2idx) + 1,
+            embedding_dim=128
+        )
+        # 3/4/5 多尺寸卷积核
+        self.convs = nn.ModuleList([
+            nn.Conv2d(1, 100, (3, 128)),
+            nn.Conv2d(1, 100, (4, 128)),
+            nn.Conv2d(1, 100, (5, 128))
+        ])
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(300, len(set(labels.tolist())))
+
+    def conv_and_pool(self, x, conv):
+        x = conv(x)
+        x = self.relu(x)
+        x = x.squeeze(3)
+        x = torch.max_pool1d(x, x.size(2))
+        x = x.squeeze(2)
+        return x
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = x.unsqueeze(1)
+        x1 = self.conv_and_pool(x, self.convs[0])
+        x2 = self.conv_and_pool(x, self.convs[1])
+        x3 = self.conv_and_pool(x, self.convs[2])
+        x = torch.cat((x1, x2, x3), dim=1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+# ===================== 模型、损失、优化器 =====================
+model = TextCNN().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# ===================== 训练参数（修改此处轮次：5/10/15/20） =====================
+epochs = 5  # 跑5轮就写5，跑10轮就写10，以此类推
+print("开始训练 TextCNN...")
+
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    for batch_x, batch_y in train_loader:
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+
+        outputs = model(batch_x)
+        loss = criterion(outputs, batch_y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+    print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
+
+# ===================== 测试 & 指标计算（已修复） =====================
+model.eval()
+all_pred = []
+all_true = []
+
+with torch.no_grad():
+    for batch_x, batch_y in test_loader:
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+
+        outputs = model(batch_x)
+        _, predicted = torch.max(outputs, 1)
+        all_pred.extend(predicted.cpu().numpy())
+        all_true.extend(batch_y.cpu().numpy())
+
+# 修复点：三个指标都传入了all_true和all_pred
+acc = accuracy_score(all_true, all_pred)
+precision = precision_score(all_true, all_pred, average="weighted")
+recall = recall_score(all_true, all_pred, average="weighted")
+f1 = f1_score(all_true, all_pred, average="weighted")
+# 传入中文类别名，报告直接显示中文
+report = classification_report(
+    all_true,
+    all_pred,
+    target_names=class_names
+)
+
+# 控制台输出
+print("\n========== TextCNN 评价结果 ==========")
+print("Accuracy :", round(acc, 4))
+print("Precision:", round(precision, 4))
+print("Recall   :", round(recall, 4))
+print("F1-score :", round(f1, 4))
+
+print("\n分类报告（中文类别）：")
+print(report)
+
+# ===================== 保存结果（自动匹配轮次） =====================
+save_path = f"report/textcnn_upgrade{epochs}.txt"
+with open(save_path, "w", encoding="utf-8") as f:
+    f.write(f"模型：多卷积核TextCNN (epoch={epochs})\n\n")
+    f.write(f"Accuracy : {acc:.4f}\n")
+    f.write(f"Precision: {precision:.4f}\n")
+    f.write(f"Recall   : {recall:.4f}\n")
+    f.write(f"F1-score : {f1:.4f}\n\n")
+    f.write("分类报告：\n")
+    f.write(report)
+
+print(f"\n结果已保存至: {save_path}")
